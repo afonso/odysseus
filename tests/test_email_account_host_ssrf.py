@@ -16,6 +16,7 @@ Dovecot is a normal setup). Names that do not resolve pass through, because
 the connect that follows fails with the same DNS error.
 """
 
+import socket
 import unittest.mock as mock
 
 import pytest
@@ -32,6 +33,8 @@ from src.url_safety import check_outbound_host
     "fe80::1",
     "0.0.0.0",
     "224.0.0.1",
+    "100.100.100.200",
+    "[100.100.100.200]",
 ])
 def test_always_blocked_addresses(host):
     ok, reason = check_outbound_host(host)
@@ -40,10 +43,18 @@ def test_always_blocked_addresses(host):
     assert ok is False
 
 
-# "::1" is deliberately absent: CPython < 3.13 classifies ::/8 as reserved, so
-# the shared _classify() rejects IPv6 loopback unconditionally (same as
-# check_outbound_url). Not asserted either way here.
-@pytest.mark.parametrize("host", ["127.0.0.1", "10.0.0.5", "192.168.1.10", "100.64.1.1", "localhost", "LOCALHOST.", "mail.localhost", "ip6-localhost"])
+@pytest.mark.parametrize("host", [
+    "127.0.0.1",
+    "::1",
+    "[::1]",
+    "10.0.0.5",
+    "192.168.1.10",
+    "100.64.1.1",
+    "localhost",
+    "LOCALHOST.",
+    "mail.localhost",
+    "ip6-localhost",
+])
 def test_private_and_loopback_gated_by_block_private(host):
     ok, _ = check_outbound_host(host, block_private=True)
     assert ok is False, host
@@ -196,7 +207,7 @@ async def test_create_account_rejects_private_host_for_non_admin(monkeypatch):
     create = _route(router, "/api/email/accounts", "POST")
     with mock.patch("core.database.SessionLocal", _make_orm_db()):
         result = await create(
-            {"name": "Scan", "imap_host": "mail.example.test", "smtp_host": "10.0.0.5", "imap_user": "u", "imap_password": "p"},
+            {"name": "Scan", "imap_host": "93.184.216.34", "smtp_host": "10.0.0.5", "imap_user": "u", "imap_password": "p"},
             owner="regular-user",
         )
     assert result["ok"] is False
@@ -263,3 +274,139 @@ async def test_update_config_rejects_bad_host(monkeypatch):
         result = await update_cfg({"smtp_host": "10.0.0.1", "smtp_port": 6379}, account_id=None, owner="regular-user")
     assert result["ok"] is False
     assert "Rejected SMTP host" in result["error"]
+
+
+# ── adversarial runtime & connection-time tests ─────────────────────────────
+
+def test_safe_create_connection_blocks_dns_rebinding():
+    from src.url_safety import safe_create_connection, SSRFBlockedError
+    with mock.patch("socket.getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 993))]):
+        with pytest.raises(SSRFBlockedError) as exc_info:
+            safe_create_connection(("rebind.example.org", 993), block_private=False)
+        assert "link-local" in str(exc_info.value)
+
+
+def test_safe_create_connection_multiple_ips_fails_closed():
+    from src.url_safety import safe_create_connection, SSRFBlockedError
+    mixed_addrs = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 993)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", 993)),
+    ]
+    with mock.patch("socket.getaddrinfo", return_value=mixed_addrs):
+        with pytest.raises(SSRFBlockedError) as exc_info:
+            safe_create_connection(("dual.example.org", 993), block_private=True)
+        assert "private/shared/loopback" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_test_connection_endpoint_dns_rebinding_blocked(monkeypatch):
+    """If DNS changes between save-check and connection, connect-time validation stops it."""
+    import routes.email_routes as email_routes
+    _set_admin(monkeypatch, False)
+    router = email_routes.setup_email_routes()
+    test_conn = _route(router, "/api/email/accounts/test", "POST")
+
+    body = {
+        "imap_host": "rebind.example.org", "imap_port": 993, "imap_user": "u", "imap_password": "p",
+        "imap_starttls": False,
+    }
+    rebinding_addrs = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 993))]
+    with mock.patch("routes.email_routes._check_mail_host", return_value=None), \
+         mock.patch("socket.getaddrinfo", return_value=rebinding_addrs):
+        result = await test_conn(req=_Req(body), owner="regular-user")
+
+    assert result["ok"] is False
+    assert "Rejected IMAP host" in result["imap"]["error"]
+    assert "private/shared/loopback" in result["imap"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_imap_connect_blocks_preexisting_db_row(monkeypatch):
+    """A database row with private host (preexisting, restored, or DB-injected) fails closed at runtime."""
+    import routes.email_helpers as email_helpers
+    from core.database import EmailAccount
+    from src.url_safety import SSRFBlockedError
+    _set_admin(monkeypatch, False)
+    Factory = _make_orm_db()
+    db = Factory()
+    db.add(EmailAccount(id="acct-malicious", owner="regular-user", name="Evil", imap_host="127.0.0.1", imap_port=993, imap_user="u", imap_password="p"))
+    db.commit()
+    db.close()
+
+    with mock.patch("core.database.SessionLocal", Factory):
+        with pytest.raises(SSRFBlockedError) as exc_info:
+            email_helpers._imap_connect("acct-malicious", owner="regular-user")
+        assert "private/shared/loopback" in str(exc_info.value)
+
+
+def test_runtime_send_smtp_message_blocks_metadata_host(monkeypatch):
+    """_send_smtp_message fails closed on cloud metadata destination."""
+    import routes.email_helpers as email_helpers
+    from src.url_safety import SSRFBlockedError
+    _set_admin(monkeypatch, True)
+    cfg = {
+        "smtp_host": "169.254.169.254",
+        "smtp_port": 25,
+        "owner": "admin",
+    }
+    with pytest.raises(SSRFBlockedError) as exc_info:
+        email_helpers._send_smtp_message(cfg, "from@example.com", ["to@example.com"], b"data")
+    assert "link-local" in str(exc_info.value)
+
+
+def test_ipv6_loopback_allowed_for_admin_blocked_for_non_admin():
+    from src.url_safety import safe_create_connection, SSRFBlockedError
+    mock_sock = mock.MagicMock()
+    with mock.patch("socket.socket", return_value=mock_sock):
+        sock = safe_create_connection(("::1", 993), block_private=False)
+        assert sock is mock_sock
+        mock_sock.connect.assert_called_with(("::1", 993))
+
+    with pytest.raises(SSRFBlockedError) as exc_info:
+        safe_create_connection(("::1", 993), block_private=True)
+    assert "private/shared/loopback" in str(exc_info.value)
+
+
+def test_email_block_private_ips_env_overrides_admin(monkeypatch):
+    from src.url_safety import SSRFBlockedError
+    import routes.email_helpers as email_helpers
+    _set_admin(monkeypatch, True)
+    monkeypatch.setenv("EMAIL_BLOCK_PRIVATE_IPS", "true")
+    cfg = {
+        "smtp_host": "127.0.0.1",
+        "smtp_port": 25,
+        "owner": "admin",
+    }
+    with pytest.raises(SSRFBlockedError) as exc_info:
+        email_helpers._send_smtp_message(cfg, "from@example.com", ["to@example.com"], b"data")
+    assert "private/shared/loopback" in str(exc_info.value)
+
+
+def test_tls_sni_preserved_during_safe_connection():
+    import routes.email_helpers as email_helpers
+    mock_sock = mock.MagicMock()
+    mock_ssl_sock = mock.MagicMock()
+    mock_ctx = mock.MagicMock()
+    mock_ctx.wrap_socket.return_value = mock_ssl_sock
+
+    with mock.patch("routes.email_helpers.safe_create_connection", return_value=mock_sock):
+        imap = email_helpers.SafeIMAP4_SSL.__new__(email_helpers.SafeIMAP4_SSL)
+        imap.host = "imap.secure.example.com"
+        imap.port = 993
+        imap.ssl_context = mock_ctx
+        res = imap._create_socket(10)
+        mock_ctx.wrap_socket.assert_called_with(mock_sock, server_hostname="imap.secure.example.com")
+        assert res is mock_ssl_sock
+
+    mock_smtp_sock = mock.MagicMock()
+    mock_ctx.wrap_socket.return_value = mock_smtp_sock
+    with mock.patch("routes.email_helpers.safe_create_connection", return_value=mock_sock):
+        smtp = email_helpers.SafeSMTP_SSL.__new__(email_helpers.SafeSMTP_SSL)
+        smtp._host = "smtp.secure.example.com"
+        smtp.context = mock_ctx
+        smtp.source_address = None
+        res = smtp._get_socket("smtp.secure.example.com", 465, 10)
+        mock_ctx.wrap_socket.assert_called_with(mock_sock, server_hostname="smtp.secure.example.com")
+        assert res is mock_smtp_sock
+
+

@@ -33,6 +33,14 @@ ALLOWED_SCHEMES = ("http", "https")
 # versions for other special ranges.
 _SHARED_ADDRESS_SPACE_V4 = ipaddress.ip_network("100.64.0.0/10")
 
+# Well-known cloud instance metadata endpoints that do not sit in link-local (e.g. Alibaba Cloud 100.100.100.200).
+_METADATA_IPS = {ipaddress.ip_address("100.100.100.200")}
+
+
+class SSRFBlockedError(OSError):
+    """Raised when an outbound connection attempt is blocked by SSRF policy."""
+    pass
+
 
 def _default_resolver(host: str) -> List[str]:
     """Resolve a hostname to the list of IP strings it maps to (A + AAAA)."""
@@ -44,13 +52,16 @@ def _classify(ip: ipaddress._BaseAddress, *, block_private: bool) -> Optional[st
     # IPv4-mapped IPv6 (e.g. ::ffff:169.254.169.254) — judge the embedded v4.
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
-    if ip.is_link_local:
+    if ip.is_link_local or ip in _METADATA_IPS:
         return f"link-local address blocked (SSRF metadata risk): {ip}"
+    if ip.is_loopback:
+        if block_private:
+            return f"private/shared/loopback address blocked: {ip}"
+        return None
     if ip.is_multicast or ip.is_reserved or ip.is_unspecified:
         return f"disallowed address: {ip}"
     if block_private and (
         ip.is_private
-        or ip.is_loopback
         or (isinstance(ip, ipaddress.IPv4Address) and ip in _SHARED_ADDRESS_SPACE_V4)
     ):
         return f"private/shared/loopback address blocked: {ip}"
@@ -196,3 +207,121 @@ def check_outbound_host(
             return True, "unresolved (deferred to connect)"
         return False, "host does not resolve to an IP"
     return True, "ok"
+
+
+def safe_create_connection(
+    address: Tuple[str, int],
+    timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+    source_address: Optional[Tuple[str, int]] = None,
+    *,
+    block_private: bool = True,
+    resolver: Optional[Callable[[str], List[str]]] = None,
+) -> socket.socket:
+    """Establish a TCP connection guaranteed not to connect to prohibited IP addresses.
+
+    Guards against DNS rebinding (TOCTOU) by resolving the hostname once, validating
+    EVERY returned address against the SSRF policy, and connecting directly to the
+    validated IP address. The caller retains the original hostname for TLS SNI and
+    certificate verification.
+    """
+    host, port = address
+    port = int(port or 0)
+    if not isinstance(host, str):
+        raise ValueError("host must be a string")
+    host = host.strip()
+    if not host:
+        raise ValueError("host is required")
+    if any(ch.isspace() for ch in host) or any(ch in host for ch in "/\\@?#"):
+        raise ValueError("host must be a bare hostname or IP address")
+
+    literal = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    ip = None
+    if ":" in literal:
+        try:
+            ip = ipaddress.ip_address(literal.split("%")[0])
+        except ValueError:
+            pass
+    else:
+        try:
+            ip = ipaddress.ip_address(literal)
+        except ValueError:
+            pass
+
+    if ip is not None:
+        reason = _classify(ip, block_private=block_private)
+        if reason:
+            raise SSRFBlockedError(f"Rejected mail host: {reason}")
+        family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT and timeout is not None:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect((str(ip), port))
+            return sock
+        except Exception:
+            sock.close()
+            raise
+
+    if _is_localhost_name(host):
+        if block_private:
+            raise SSRFBlockedError(f"Rejected mail host: private/shared/loopback address blocked: {host}")
+
+    if resolver is not None:
+        raw_ips = resolver(host)
+        addr_list = []
+        for raw in raw_ips or []:
+            try:
+                raw_ip = ipaddress.ip_address(raw.split("%")[0])
+                af = socket.AF_INET6 if raw_ip.version == 6 else socket.AF_INET
+                addr_list.append((af, socket.SOCK_STREAM, 6, "", (str(raw_ip), port)))
+            except ValueError:
+                continue
+    else:
+        try:
+            addr_list = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        except Exception as e:
+            raise OSError(f"host does not resolve: {e}")
+
+    if not addr_list:
+        raise OSError("host does not resolve to an IP")
+
+    validated_entries = []
+    for res in addr_list:
+        af, socktype, proto, canonname, sa = res
+        ip_str = sa[0].split("%")[0]
+        try:
+            resolved_ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        reason = _classify(resolved_ip, block_private=block_private)
+        if reason:
+            raise SSRFBlockedError(f"Rejected mail host: {reason}")
+        validated_entries.append(res)
+
+    if not validated_entries:
+        raise OSError("host does not resolve to a valid IP")
+
+    exceptions = []
+    for af, socktype, proto, canonname, sa in validated_entries:
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT and timeout is not None:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sa)
+            return sock
+        except OSError as exc:
+            exceptions.append(exc)
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    if exceptions:
+        raise exceptions[0]
+    raise OSError(f"Failed to connect to {host}:{port}")

@@ -33,11 +33,74 @@ from pathlib import Path
 from fastapi import Query, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional, List
+from contextvars import ContextVar
 
 from src.auth_helpers import _auth_disabled, get_current_user
 from src.secret_storage import decrypt as _decrypt
+from src.url_safety import safe_create_connection, SSRFBlockedError
 
 logger = logging.getLogger(__name__)
+
+
+_current_mail_owner: ContextVar[Optional[str]] = ContextVar("_current_mail_owner", default=None)
+_current_block_private: ContextVar[Optional[bool]] = ContextVar("_current_block_private", default=None)
+
+
+def _mail_host_block_private(owner: str | None) -> bool:
+    """Whether loopback / LAN mail hosts are off-limits for this owner.
+
+    Odysseus is local-first: an admin pointing IMAP at a Dovecot on the LAN
+    or on localhost is a normal setup. Non-admins are not trusted with the
+    server's network position (THREAT_MODEL.md lists email as admin-only),
+    so for them private and loopback targets are rejected as well. Set
+    EMAIL_BLOCK_PRIVATE_IPS=true to apply the lockdown to everyone.
+    """
+    if os.getenv("EMAIL_BLOCK_PRIVATE_IPS", "false").lower() == "true":
+        return True
+    from src.tool_security import owner_is_admin_or_single_user
+    return not owner_is_admin_or_single_user(owner)
+
+
+class SafeIMAP4(imaplib.IMAP4):
+    def _create_socket(self, timeout):
+        bp = _current_block_private.get()
+        if bp is None:
+            bp = _mail_host_block_private(_current_mail_owner.get())
+        return safe_create_connection((self.host, self.port), timeout=timeout, block_private=bp)
+
+
+class SafeIMAP4_SSL(imaplib.IMAP4_SSL):
+    def _create_socket(self, timeout):
+        bp = _current_block_private.get()
+        if bp is None:
+            bp = _mail_host_block_private(_current_mail_owner.get())
+        sock = safe_create_connection((self.host, self.port), timeout=timeout, block_private=bp)
+        return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+
+
+class SafeSMTP(smtplib.SMTP):
+    def _get_socket(self, host, port, timeout):
+        bp = _current_block_private.get()
+        if bp is None:
+            bp = _mail_host_block_private(_current_mail_owner.get())
+        return safe_create_connection((host, port), timeout=timeout, source_address=self.source_address, block_private=bp)
+
+
+class SafeSMTP_SSL(smtplib.SMTP_SSL):
+    def _get_socket(self, host, port, timeout):
+        bp = _current_block_private.get()
+        if bp is None:
+            bp = _mail_host_block_private(_current_mail_owner.get())
+        sock = safe_create_connection((host, port), timeout=timeout, source_address=self.source_address, block_private=bp)
+        server_hostname = self._host or host
+        return self.context.wrap_socket(sock, server_hostname=server_hostname)
+
+
+# Bind module-level constructors to safe implementations so connections are protected by default.
+imaplib.IMAP4 = SafeIMAP4
+imaplib.IMAP4_SSL = SafeIMAP4_SSL
+smtplib.SMTP = SafeSMTP
+smtplib.SMTP_SSL = SafeSMTP_SSL
 
 
 class EmailNotConfiguredError(RuntimeError):
@@ -166,6 +229,7 @@ def _send_smtp_message(cfg: dict, from_addr: str, recipients: list[str], message
     port = int(cfg.get("smtp_port") or 465)
     user = cfg.get("smtp_user") or ""
     password = cfg.get("smtp_password") or ""
+    effective_owner = cfg.get("owner") or ""
 
     def _auth_smtp(smtp):
         if cfg.get("oauth_provider") == "google":
@@ -179,21 +243,34 @@ def _send_smtp_message(cfg: dict, from_addr: str, recipients: list[str], message
 
     security = _smtp_security_mode(cfg)
 
-    if security == "ssl":
-        with smtplib.SMTP_SSL(host, port, timeout=timeout) as smtp:
+    token_owner = _current_mail_owner.set(effective_owner)
+    token_bp = _current_block_private.set(_mail_host_block_private(effective_owner))
+    try:
+        if security == "ssl":
+            with smtplib.SMTP_SSL(host, port, timeout=timeout) as smtp:
+                _auth_smtp(smtp)
+                smtp.sendmail(from_addr, recipients, message)
+            return
+
+        with smtplib.SMTP(host, port, timeout=timeout) as smtp:
+            if security == "starttls":
+                smtp.starttls()
             _auth_smtp(smtp)
             smtp.sendmail(from_addr, recipients, message)
-        return
-
-    with smtplib.SMTP(host, port, timeout=timeout) as smtp:
-        if security == "starttls":
-            smtp.starttls()
-        _auth_smtp(smtp)
-        smtp.sendmail(from_addr, recipients, message)
+    finally:
+        _current_mail_owner.reset(token_owner)
+        _current_block_private.reset(token_bp)
 
 
 def _friendly_email_auth_error(protocol: str, host: str, error: object) -> str:
     """Return a clearer setup error for known provider auth policies."""
+    if isinstance(error, SSRFBlockedError):
+        msg = str(error)
+        if msg.startswith("Rejected mail host: "):
+            return f"Rejected {protocol} host: " + msg[len("Rejected mail host: "):]
+        return msg
+    if "Rejected " in str(error):
+        return str(error)
     raw = str(error or "")
     lower = raw.lower()
     host_lower = (host or "").lower()
@@ -1068,6 +1145,7 @@ def _get_email_config(account_id: str | None = None, owner: str = "") -> dict:
                 cfg = {
                     "account_id": row.id,
                     "account_name": row.name,
+                    "owner": row.owner or owner or "",
                     "smtp_host": row.smtp_host or "",
                     "smtp_port": int(row.smtp_port or 465),
                     "smtp_security": _smtp_security_mode({"smtp_security": getattr(row, "smtp_security", ""), "smtp_port": row.smtp_port}),
@@ -1101,6 +1179,7 @@ def _get_email_config(account_id: str | None = None, owner: str = "") -> dict:
     cfg = {
         "account_id": resolved_id,
         "account_name": "legacy",
+        "owner": owner or "",
         "smtp_host": settings.get("smtp_host", os.environ.get("SMTP_HOST", "")),
         "smtp_port": int(settings.get("smtp_port", os.environ.get("SMTP_PORT", "465")) or 465),
         "smtp_security": _smtp_security_mode({
@@ -1164,38 +1243,55 @@ def _open_imap_connection(
     starttls: bool,
     timeout: int = _IMAP_TIMEOUT_SECONDS,
     ssl_context=None,
+    owner: str | None = None,
+    block_private: bool | None = None,
 ):
     """Open an IMAP connection using the configured security mode."""
-    port = int(port or 993)
-    if starttls:
-        conn = imaplib.IMAP4(host, port, timeout=timeout)
-        try:
-            if ssl_context:
-                conn.starttls(ssl_context=ssl_context)
-            else:
-                conn.starttls()
-        except Exception:
-            # Don't leak the open plain socket if the STARTTLS upgrade is
-            # rejected; close it before propagating. (#3174)
-            try:
-                conn.shutdown()
-            except Exception:
-                pass
-            raise
-    elif port == 993:
-        kwargs = {"ssl_context": ssl_context} if ssl_context else {}
-        conn = imaplib.IMAP4_SSL(host, port, timeout=timeout, **kwargs)
-    else:
-        conn = imaplib.IMAP4(host, port, timeout=timeout)
+    token_owner = None
+    token_bp = None
+    if owner is not None:
+        token_owner = _current_mail_owner.set(owner)
+    if block_private is not None:
+        token_bp = _current_block_private.set(block_private)
+    elif owner is not None:
+        token_bp = _current_block_private.set(_mail_host_block_private(owner))
+
     try:
-        conn.sock.settimeout(timeout)
-    except Exception:
-        pass
-    # Raise the IMAP line-length limit from the default 1 MB to 50 MB so that
-    # large mailboxes (tens of thousands of messages) don't crash with
-    # "got more than 1000000 bytes" on UID SEARCH ALL.  (#2883)
-    imaplib._MAXLINE = 50_000_000
-    return conn
+        port = int(port or 993)
+        if starttls:
+            conn = imaplib.IMAP4(host, port, timeout=timeout)
+            try:
+                if ssl_context:
+                    conn.starttls(ssl_context=ssl_context)
+                else:
+                    conn.starttls()
+            except Exception:
+                # Don't leak the open plain socket if the STARTTLS upgrade is
+                # rejected; close it before propagating. (#3174)
+                try:
+                    conn.shutdown()
+                except Exception:
+                    pass
+                raise
+        elif port == 993:
+            kwargs = {"ssl_context": ssl_context} if ssl_context else {}
+            conn = imaplib.IMAP4_SSL(host, port, timeout=timeout, **kwargs)
+        else:
+            conn = imaplib.IMAP4(host, port, timeout=timeout)
+        try:
+            conn.sock.settimeout(timeout)
+        except Exception:
+            pass
+        # Raise the IMAP line-length limit from the default 1 MB to 50 MB so that
+        # large mailboxes (tens of thousands of messages) don't crash with
+        # "got more than 1000000 bytes" on UID SEARCH ALL.  (#2883)
+        imaplib._MAXLINE = 50_000_000
+        return conn
+    finally:
+        if token_bp is not None:
+            _current_block_private.reset(token_bp)
+        if token_owner is not None:
+            _current_mail_owner.reset(token_owner)
 
 def _imap_connect(account_id: str | None = None, owner: str = "",
                   timeout: int = _IMAP_TIMEOUT_SECONDS):
@@ -1214,6 +1310,7 @@ def _imap_connect(account_id: str | None = None, owner: str = "",
         raise EmailNotConfiguredError(
             f"IMAP is not configured for account {cfg.get('account_name') or 'default'!r}"
         )
+    effective_owner = cfg.get("owner") or owner or ""
     # Connection mode:
     #   STARTTLS on → plain + upgrade
     #   STARTTLS off + port 993 → implicit SSL (IMAPS)
@@ -1221,32 +1318,39 @@ def _imap_connect(account_id: str | None = None, owner: str = "",
     # The last branch is critical: previously this fell into IMAP4_SSL
     # for any non-STARTTLS port, which would fail the TLS handshake on
     # plain local servers (Dovecot on 31143, etc.).
-    conn = _open_imap_connection(
-        cfg["imap_host"],
-        cfg["imap_port"],
-        starttls=bool(cfg.get("imap_starttls")),
-        timeout=timeout,
-    )
+    token_owner = _current_mail_owner.set(effective_owner)
+    token_bp = _current_block_private.set(_mail_host_block_private(effective_owner))
     try:
-        if cfg.get("oauth_provider") == "google":
-            token = _get_valid_google_token(cfg.get("account_id"), cfg)
-            if not token:
-                raise RuntimeError("Google OAuth token unavailable — reconnect the account in Settings → Integrations")
-            conn.authenticate("XOAUTH2", lambda x: _xoauth2_bytes(cfg["imap_user"], token))
-        else:
-            conn.login(cfg["imap_user"], cfg["imap_password"])
-    except Exception:
-        # A failed AUTHENTICATE (e.g. an Office 365 app password on an
-        # MFA-enabled tenant, #3174, or an expired/revoked OAuth token)
-        # otherwise orphans the already-connected socket; close it before
-        # propagating so a misconfigured account can't leak one descriptor
-        # per retry / background poller pass.
+        conn = _open_imap_connection(
+            cfg["imap_host"],
+            cfg["imap_port"],
+            starttls=bool(cfg.get("imap_starttls")),
+            timeout=timeout,
+        )
         try:
-            conn.shutdown()
+            if cfg.get("oauth_provider") == "google":
+                token = _get_valid_google_token(cfg.get("account_id"), cfg)
+                if not token:
+                    raise RuntimeError("Google OAuth token unavailable — reconnect the account in Settings → Integrations")
+                conn.authenticate("XOAUTH2", lambda x: _xoauth2_bytes(cfg["imap_user"], token))
+            else:
+                conn.login(cfg["imap_user"], cfg["imap_password"])
         except Exception:
-            pass
-        raise
-    return conn
+            # A failed AUTHENTICATE (e.g. an Office 365 app password on an
+            # MFA-enabled tenant, #3174, or an expired/revoked OAuth token)
+            # otherwise orphans the already-connected socket; close it before
+            # propagating so a misconfigured account can't leak one descriptor
+            # per retry / background poller pass.
+            try:
+                conn.shutdown()
+            except Exception:
+                pass
+            raise
+        return conn
+    finally:
+        _current_mail_owner.reset(token_owner)
+        _current_block_private.reset(token_bp)
+
 
 
 from contextlib import contextmanager
