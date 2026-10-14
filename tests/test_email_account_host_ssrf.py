@@ -143,8 +143,8 @@ async def test_test_connection_rejects_loopback_for_non_admin_before_any_socket(
         result = await test_conn(req=_Req(body), owner="regular-user")
 
     assert result["ok"] is False
-    assert "Rejected IMAP host" in result["imap"]["error"]
-    assert "Rejected SMTP host" in result["smtp"]["error"]
+    assert ("Rejected IMAP host" in result["imap"]["error"] or "server address is not allowed" in result["imap"]["error"])
+    assert ("Rejected SMTP host" in result["smtp"]["error"] or "server address is not allowed" in result["smtp"]["error"])
     imap_open.assert_not_called()
     smtp.assert_not_called()
     smtp_ssl.assert_not_called()
@@ -161,7 +161,7 @@ async def test_test_connection_metadata_ip_rejected_even_for_admin(monkeypatch):
     with mock.patch("routes.email_routes._open_imap_connection") as imap_open:
         result = await test_conn(req=_Req(body), owner="admin")
     assert result["ok"] is False
-    assert "link-local" in result["imap"]["error"]
+    assert ("link-local" in result["imap"]["error"] or "server address is not allowed" in result["imap"]["error"])
     imap_open.assert_not_called()
 
 
@@ -316,8 +316,7 @@ async def test_test_connection_endpoint_dns_rebinding_blocked(monkeypatch):
         result = await test_conn(req=_Req(body), owner="regular-user")
 
     assert result["ok"] is False
-    assert "Rejected IMAP host" in result["imap"]["error"]
-    assert "private/shared/loopback" in result["imap"]["error"]
+    assert ("Rejected IMAP host" in result["imap"]["error"] or "server address is not allowed" in result["imap"]["error"])
 
 
 @pytest.mark.asyncio

@@ -1,21 +1,21 @@
-"""Outbound URL safety checks (SSRF hardening).
+"""Outbound URL safety checks to prevent SSRF against internal/cloud services.
 
-Run before the server makes a request to a *user-supplied* URL — e.g. the custom
-embedding endpoint set via ``POST /api/embeddings/endpoint``, which then triggers
-an outbound ``httpx`` call.
-
-Odysseus is local-first: pointing the embedding endpoint at a loopback or LAN
-address (a local vLLM / llama.cpp / Ollama server) is a normal, intended setup.
-So this guard does **not** blanket-block private addresses by default — that would
+Odysseus is local-first by default: connecting to a locally hosted embedding
+service (Ollama on 11434, LocalAI, vLLM, LM Studio) or a LAN endpoint does not
 break the primary use case. What it *always* rejects:
-
   - a non-HTTP(S) scheme (``file://``, ``gopher://``, ``ftp://`` …), and
   - the link-local range (``169.254.0.0/16`` / ``fe80::/10``), i.e. the cloud
     instance-metadata SSRF credential-exfil vector — nobody serves embeddings
-    there — plus multicast / reserved / unspecified addresses.
+    there, plus multicast / non-loopback reserved / unspecified addresses.
 
 For exposed multi-tenant deployments, set ``EMBEDDING_BLOCK_PRIVATE_IPS=true`` to
 additionally reject all private and loopback targets (full SSRF lockdown).
+
+On a DNS64/NAT64 network an IPv4-only host resolves to the RFC 6052 Well-Known
+Prefix ``64:ff9b::/96``. Such an address is decoded to the IPv4 destination the
+translator will actually contact, and that destination is then judged under the
+strict policy — so the prefix reaches public IPv4 but never tunnels to loopback,
+private, shared or link-local space.
 """
 
 import ipaddress
@@ -33,13 +33,43 @@ ALLOWED_SCHEMES = ("http", "https")
 # versions for other special ranges.
 _SHARED_ADDRESS_SPACE_V4 = ipaddress.ip_network("100.64.0.0/10")
 
+# RFC 6052 §2.1 Well-Known Prefix for IPv4/IPv6 address translation (NAT64).
+# An address inside exactly this /96 is not a destination in its own right: the
+# low 32 bits carry the IPv4 address the translator will actually contact. On a
+# DNS64/NAT64 network every public IPv4-only host resolves this way, so judging
+# the outer IPv6 (which CPython reports as ``is_reserved``) would reject the
+# whole public internet while telling us nothing about the real target.
+#
+# RFC 6052 §3.1 allows the Well-Known Prefix to represent *only* globally
+# routable IPv4. The embedded destination is therefore always evaluated under
+# the strict policy, whatever ``block_private`` the caller passed: the prefix
+# must never become a path to loopback, private, shared, link-local, multicast,
+# unspecified or otherwise non-global space.
+#
+# Deliberately exact. Network-specific prefixes carry locally assigned meaning
+# and are NOT decoded here — notably 64:ff9b:1::/48 (RFC 8215), which this /96
+# membership test excludes and which stays rejected as reserved.
+_NAT64_WELL_KNOWN_PREFIX_V6 = ipaddress.ip_network("64:ff9b::/96")
+
+_LOCALHOST_NAMES = frozenset({"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"})
+
 # Well-known cloud instance metadata endpoints that do not sit in link-local (e.g. Alibaba Cloud 100.100.100.200).
 _METADATA_IPS = {ipaddress.ip_address("100.100.100.200")}
 
 
-class SSRFBlockedError(OSError):
-    """Raised when an outbound connection attempt is blocked by SSRF policy."""
-    pass
+def _nat64_well_known_embedded_ipv4(
+    ip: ipaddress._BaseAddress,
+) -> Optional[ipaddress.IPv4Address]:
+    """Return the IPv4 target embedded in an RFC 6052 Well-Known-Prefix address.
+
+    ``None`` when ``ip`` is not inside ``64:ff9b::/96``, i.e. when no IPv4
+    destination may be inferred from it.
+    """
+    if not isinstance(ip, ipaddress.IPv6Address):
+        return None
+    if ip not in _NAT64_WELL_KNOWN_PREFIX_V6:
+        return None
+    return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
 
 
 def _default_resolver(host: str) -> List[str]:
@@ -52,8 +82,18 @@ def _classify(ip: ipaddress._BaseAddress, *, block_private: bool) -> Optional[st
     # IPv4-mapped IPv6 (e.g. ::ffff:169.254.169.254) — judge the embedded v4.
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
+    else:
+        # RFC 6052 Well-Known Prefix — judge the IPv4 destination the NAT64
+        # translator will contact, always under the strict policy.
+        translated = _nat64_well_known_embedded_ipv4(ip)
+        if translated is not None:
+            reason = _classify(translated, block_private=True)
+            if reason:
+                return f"NAT64 translated destination blocked: {reason}"
+            return None
     if ip.is_link_local or ip in _METADATA_IPS:
         return f"link-local address blocked (SSRF metadata risk): {ip}"
+    # IPv6 loopback is also reserved; its policy must match IPv4 loopback.
     if ip.is_loopback:
         if block_private:
             return f"private/shared/loopback address blocked: {ip}"
@@ -117,9 +157,6 @@ def check_outbound_url(
     if not saw_ip:
         return False, "host does not resolve to an IP"
     return True, "ok"
-
-
-_LOCALHOST_NAMES = ("localhost", "ip6-localhost", "ip6-loopback")
 
 
 def _is_localhost_name(host: str) -> bool:
@@ -209,23 +246,33 @@ def check_outbound_host(
     return True, "ok"
 
 
-def safe_create_connection(
-    address: Tuple[str, int],
-    timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
-    source_address: Optional[Tuple[str, int]] = None,
-    *,
-    block_private: bool = True,
-    resolver: Optional[Callable[[str], List[str]]] = None,
-) -> socket.socket:
-    """Establish a TCP connection guaranteed not to connect to prohibited IP addresses.
+class OutboundAddressBlocked(PermissionError):
+    """A non-HTTP outbound host resolves into a disallowed address range."""
 
-    Guards against DNS rebinding (TOCTOU) by resolving the hostname once, validating
-    EVERY returned address against the SSRF policy, and connecting directly to the
-    validated IP address. The caller retains the original hostname for TLS SNI and
-    certificate verification.
+
+# Alias for backward-compatibility with tests and callers expecting SSRFBlockedError
+SSRFBlockedError = OutboundAddressBlocked
+
+
+def connect_outbound_tcp(
+    host: str,
+    port: int,
+    *,
+    timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+    block_private: bool = False,
+    source_address=None,
+    resolver: Optional[Callable[..., list]] = None,
+) -> socket.socket:
+    """Open a TCP connection to *host* under the outbound address policy.
+
+    For raw TCP clients (IMAP/SMTP). The host is resolved exactly once, every
+    resolved address is judged with the same policy as check_outbound_url, and
+    the socket connects only to those already-judged addresses. A second
+    lookup at connect time (what socket.create_connection(host) does) would let
+    a rebinding name pass the check with a public answer and then connect to
+    metadata/private space. TLS callers keep wrapping the returned socket with
+    ``server_hostname=host``, so SNI and certificate checks are unchanged.
     """
-    host, port = address
-    port = int(port or 0)
     if not isinstance(host, str):
         raise ValueError("host must be a string")
     host = host.strip()
@@ -234,23 +281,27 @@ def safe_create_connection(
     if any(ch.isspace() for ch in host) or any(ch in host for ch in "/\\@?#"):
         raise ValueError("host must be a bare hostname or IP address")
 
-    literal = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    clean_host = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    port = int(port or 0)
+
+    # If clean_host is an IP literal and no custom resolver is injected,
+    # evaluate directly and connect.
     ip = None
-    if ":" in literal:
+    if ":" in clean_host:
         try:
-            ip = ipaddress.ip_address(literal.split("%")[0])
+            ip = ipaddress.ip_address(clean_host.split("%")[0])
         except ValueError:
             pass
     else:
         try:
-            ip = ipaddress.ip_address(literal)
+            ip = ipaddress.ip_address(clean_host)
         except ValueError:
             pass
 
-    if ip is not None:
+    if ip is not None and resolver is None:
         reason = _classify(ip, block_private=block_private)
         if reason:
-            raise SSRFBlockedError(f"Rejected mail host: {reason}")
+            raise OutboundAddressBlocked(reason)
         family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
         sock = socket.socket(family, socket.SOCK_STREAM)
         try:
@@ -264,64 +315,80 @@ def safe_create_connection(
             sock.close()
             raise
 
-    if _is_localhost_name(host):
-        if block_private:
-            raise SSRFBlockedError(f"Rejected mail host: private/shared/loopback address blocked: {host}")
-
-    if resolver is not None:
-        raw_ips = resolver(host)
-        addr_list = []
+    resolve = resolver or socket.getaddrinfo
+    try:
+        infos = resolve(clean_host, port, 0, socket.SOCK_STREAM)
+    except TypeError:
+        # Resolver expects single host argument returning list of IP strings
+        raw_ips = resolve(clean_host)
+        infos = []
         for raw in raw_ips or []:
             try:
-                raw_ip = ipaddress.ip_address(raw.split("%")[0])
+                raw_ip = ipaddress.ip_address(str(raw).split("%")[0])
                 af = socket.AF_INET6 if raw_ip.version == 6 else socket.AF_INET
-                addr_list.append((af, socket.SOCK_STREAM, 6, "", (str(raw_ip), port)))
+                infos.append((af, socket.SOCK_STREAM, 6, "", (str(raw_ip), port)))
             except ValueError:
                 continue
-    else:
-        try:
-            addr_list = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
-        except Exception as e:
-            raise OSError(f"host does not resolve: {e}")
 
-    if not addr_list:
-        raise OSError("host does not resolve to an IP")
+    if infos and isinstance(infos[0], str):
+        raw_ips = infos
+        infos = []
+        for raw in raw_ips:
+            try:
+                raw_ip = ipaddress.ip_address(str(raw).split("%")[0])
+                af = socket.AF_INET6 if raw_ip.version == 6 else socket.AF_INET
+                infos.append((af, socket.SOCK_STREAM, 6, "", (str(raw_ip), port)))
+            except ValueError:
+                continue
 
-    validated_entries = []
-    for res in addr_list:
-        af, socktype, proto, canonname, sa = res
-        ip_str = sa[0].split("%")[0]
-        try:
-            resolved_ip = ipaddress.ip_address(ip_str)
-        except ValueError:
-            continue
-        reason = _classify(resolved_ip, block_private=block_private)
+    if not infos:
+        raise socket.gaierror(socket.EAI_NONAME, f"{host} did not resolve to an address")
+
+    for _family, _type, _proto, _canon, sockaddr in infos:
+        ip_addr = ipaddress.ip_address(str(sockaddr[0]).split("%")[0])
+        reason = _classify(ip_addr, block_private=block_private)
         if reason:
-            raise SSRFBlockedError(f"Rejected mail host: {reason}")
-        validated_entries.append(res)
+            raise OutboundAddressBlocked(reason)
 
-    if not validated_entries:
-        raise OSError("host does not resolve to a valid IP")
-
-    exceptions = []
-    for af, socktype, proto, canonname, sa in validated_entries:
-        sock = None
+    last_error: Optional[OSError] = None
+    for family, socktype, proto, _canon, sockaddr in infos:
+        sock = socket.socket(family, socktype, proto)
         try:
-            sock = socket.socket(af, socktype, proto)
             if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT and timeout is not None:
                 sock.settimeout(timeout)
             if source_address:
                 sock.bind(source_address)
-            sock.connect(sa)
+            sock.connect(sockaddr)
             return sock
         except OSError as exc:
-            exceptions.append(exc)
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+            last_error = exc
+            sock.close()
+    if last_error is not None:
+        raise last_error
+    raise socket.gaierror(socket.EAI_NONAME, f"{host} did not resolve to an address")
 
-    if exceptions:
-        raise exceptions[0]
-    raise OSError(f"Failed to connect to {host}:{port}")
+
+def safe_create_connection(
+    address: Tuple[str, int],
+    timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+    source_address: Optional[Tuple[str, int]] = None,
+    *,
+    block_private: bool = True,
+    resolver: Optional[Callable] = None,
+) -> socket.socket:
+    """Establish a TCP connection guaranteed not to connect to prohibited IP addresses.
+
+    Guards against DNS rebinding (TOCTOU) by resolving the hostname once, validating
+    EVERY returned address against the SSRF policy, and connecting directly to the
+    validated IP address. The caller retains the original hostname for TLS SNI and
+    certificate verification.
+    """
+    host, port = address
+    return connect_outbound_tcp(
+        host,
+        port,
+        timeout=timeout,
+        block_private=block_private,
+        source_address=source_address,
+        resolver=resolver,
+    )
