@@ -230,3 +230,60 @@ def test_policy_helper_uses_shared_constants(privileges):
     assert system_mod._admin_task_action_denied("root", "action", "run_local") is None
     assert system_mod._admin_task_action_denied("alice", "action", "tidy_sessions") is None
     assert system_mod._admin_task_action_denied("alice", "llm", "run_local") is None
+
+
+@pytest.mark.asyncio
+async def test_run_admin_only_task_by_name_denied_for_non_admin(privileges, monkeypatch):
+    _seed("alice-run-name", "alice", task_type="action", action="ssh_command")
+    calls = []
+
+    class _Sched:
+        async def run_task_now(self, task_id):
+            calls.append(task_id)
+            return True
+
+    import src.event_bus as event_bus
+    monkeypatch.setattr(event_bus, "get_task_scheduler", lambda: _Sched())
+    out = await do_manage_tasks(json.dumps({
+        "action": "run", "name": "alice-run-name",
+    }), owner="alice")
+    assert out["exit_code"] == 1, out
+    assert "requires admin privileges" in out["error"]
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_admin_only_action_seals_authority_for_admin(privileges):
+    out = await do_manage_tasks(json.dumps({
+        "action": "create", "task_type": "action", "action_name": "run_local",
+        "name": "sealed-task", "schedule": "daily", "scheduled_time": "09:00",
+    }), owner="root")
+    assert out["exit_code"] == 0, out
+    task = _get(out["task_id"])
+    assert task.action == "run_local"
+    assert task.request_authority_json is not None
+
+
+def test_real_owner_has_admin_task_privileges_branches(monkeypatch):
+    """Verify owner_has_admin_task_privileges without mocking."""
+    # Auth disabled branch
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    assert policy_mod.owner_has_admin_task_privileges("alice") is True
+    assert policy_mod.owner_has_admin_task_privileges(None) is True
+
+    # Auth enabled branch with configured AuthManager
+    monkeypatch.delenv("AUTH_ENABLED", raising=False)
+
+    class FakeAuth:
+        is_configured = True
+
+        def is_admin(self, u):
+            return u == "admin"
+
+    import core.auth as c_auth
+    monkeypatch.setattr(c_auth, "AuthManager", lambda: FakeAuth())
+
+    assert policy_mod.owner_has_admin_task_privileges("admin") is True
+    assert policy_mod.owner_has_admin_task_privileges("alice") is False
+    assert policy_mod.owner_has_admin_task_privileges("internal-tool") is True
+    assert policy_mod.owner_has_admin_task_privileges(None) is False
