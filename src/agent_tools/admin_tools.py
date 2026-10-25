@@ -38,11 +38,25 @@ async def do_manage_endpoints(content: str, owner: Optional[str] = None) -> Dict
 
         elif action == "add":
             import uuid as _uuid
+            from src.url_safety import check_outbound_url
             name = args.get("name", "")
             base_url = args.get("base_url", "")
             api_key = args.get("api_key", "")
             if not base_url:
                 return {"error": "base_url is required", "exit_code": 1}
+            # SSRF hardening: validate the URL before storing it. Every entry
+            # point that accepts an external base_url must run this guard.
+            # The HTTP route (POST /api/model-endpoints) gets the same guard
+            # in #6316; this tool bypasses that route entirely, so it needs
+            # its own validation. A prompt-injection payload smuggled into a
+            # skill, note, fetched page, or email could instruct the model to
+            # register a cloud-metadata or internal-network endpoint.
+            ok, reason = check_outbound_url(
+                base_url,
+                block_private=os.getenv("MODELENDPOINT_BLOCK_PRIVATE_IPS", "false").lower() == "true",
+            )
+            if not ok:
+                return {"error": f"Rejected endpoint URL: {reason}", "exit_code": 1}
             eid = str(_uuid.uuid4())[:8]
             from datetime import datetime
             ep = ModelEndpoint(id=eid, name=name or base_url, base_url=base_url,
@@ -75,7 +89,7 @@ async def do_manage_endpoints(content: str, owner: Optional[str] = None) -> Dict
             return {"error": f"Unknown action: {action}", "exit_code": 1}
     except Exception as e:
         logger.error(f"manage_endpoints error: {e}")
-        return {"error": str(e), "exit_code": 1}
+        return {"error": "An internal error occurred while managing endpoints", "exit_code": 1}
     finally:
         db.close()
 
@@ -560,6 +574,9 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
             "hard max": "agent_input_token_hard_max",
             "token budget cap": "agent_input_token_hard_max",
             "input budget cap": "agent_input_token_hard_max",
+            "writing style": "document_writing_style", "document writing style": "document_writing_style",
+            "email writing style": "email_writing_style",
+            "reply writing style": "email_writing_style", "email reply writing style": "email_writing_style",
         }
         def _resolve(k):
             k2 = (k or "").strip().lower()
@@ -700,7 +717,7 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
             # Tool-toggle actions. These edit settings.json:disabled_tools
             # (the global list read on every chat request) rather than
             # prefs.json. Friendly aliases accepted: "shell" -> "bash",
-            # "search" -> "web_search", "browser" -> "builtin_browser",
+            # "search" -> "web_search", "browser" -> browser tools,
             # "documents" -> the document tool set, "memory" ->
             # manage_memory, etc.
             from src.settings import get_setting, save_settings, load_settings
@@ -709,7 +726,7 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
                 "terminal": ["bash"],
                 "search": ["web_search", "web_fetch"],
                 "web": ["web_search", "web_fetch"],
-                "browser": ["builtin_browser"],
+                "browser": ["builtin_browser", "private_browser"],
                 "documents": ["create_document", "edit_document", "update_document", "suggest_document"],
                 "doc": ["create_document", "edit_document", "update_document", "suggest_document"],
                 "memory": ["manage_memory"],
