@@ -3,13 +3,18 @@
 # which raises KeyError on Python 3.13+ (PEP 667). Build patched wheels here so
 # the final image / Cookbook never has to compile the broken sdists. See
 # docker/build-realesrgan-wheels.sh for the full rationale.
-FROM python:3.14-slim AS realesrgan-wheels
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+FROM python:3.14.9-slim AS realesrgan-wheels
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+COPY scripts/check_ca_trust.py /usr/local/bin/check-ca-trust.py
+RUN python /usr/local/bin/check-ca-trust.py --system
+COPY requirements-bootstrap.txt /tmp/requirements-bootstrap.txt
+RUN python -m pip install --no-cache-dir --require-hashes --only-binary=:all: --no-deps -r /tmp/requirements-bootstrap.txt \
+    && python /usr/local/bin/check-ca-trust.py --python
 COPY docker/build-realesrgan-wheels.sh /usr/local/bin/build-realesrgan-wheels.sh
 RUN bash /usr/local/bin/build-realesrgan-wheels.sh /wheels
 
-FROM python:3.14-slim
+FROM python:3.14.9-slim
 
 # System deps. tmux is required by Cookbook for background downloads/serves.
 # openssh-client is required for Cookbook remote server tests, setup, probes,
@@ -28,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     curl \
+    ca-certificates \
     git \
     nodejs \
     npm \
@@ -47,6 +53,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb1 \
     libmagic1 \
     && rm -rf /var/lib/apt/lists/*
+
+# Refresh both Python trust bundles before installing application dependencies.
+# System roots also serve web fetches, webhooks, curl, and Node's OpenSSL mode.
+COPY scripts/check_ca_trust.py /usr/local/bin/check-ca-trust.py
+RUN python /usr/local/bin/check-ca-trust.py --system
+COPY requirements-bootstrap.txt /tmp/requirements-bootstrap.txt
+RUN python -m pip install --no-cache-dir --require-hashes --only-binary=:all: --no-deps -r /tmp/requirements-bootstrap.txt \
+    && python /usr/local/bin/check-ca-trust.py --python
+ENV NODE_OPTIONS=--use-openssl-ca \
+    GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/etc/ssl/certs/ca-certificates.crt
+
+# Chromium has a separate root store. Distrust the compromised intermediate
+# public keys explicitly, including cross-signs, without waiting for CRL updates.
+COPY docker/chromium-emudhra.json /etc/chromium/policies/managed/odysseus-emudhra.json
 
 # Private browser automation wrapper used by the native `private_browser` tool.
 # Chromium is installed above, so agent-browser can drive the existing browser
@@ -72,7 +92,8 @@ RUN npm install -g agent-browser@0.35.0 --omit=dev --loglevel=error
 # /var/run/docker.sock mount). The Debian `docker.io` package ships
 # dockerd but not the client binary on slim, so grab the static client
 # tarball from download.docker.com instead.
-ARG DOCKER_CLI_VERSION=29.6.2
+# 29.9.2 includes Go 1.26.10's eMudhra intermediate-key distrust.
+ARG DOCKER_CLI_VERSION=29.9.2
 RUN ARCH="$(dpkg --print-architecture)" \
     && case "$ARCH" in \
          amd64) DARCH=x86_64 ;; \
@@ -107,6 +128,11 @@ RUN pip install --no-cache-dir python-magic==0.4.27
 COPY --from=realesrgan-wheels /wheels/ /tmp/odysseus-wheels/
 RUN pip install --no-cache-dir --no-deps /tmp/odysseus-wheels/*.whl \
     && rm -rf /tmp/odysseus-wheels
+
+# Check gRPC's effective defaults after all Python dependencies are installed.
+# The application minimum fixes its bundled roots; the checked override also
+# keeps the effective Docker selection consistent with system trust.
+RUN python /usr/local/bin/check-ca-trust.py --system --python --grpc
 
 # Copy app code
 COPY . .

@@ -36,3 +36,7 @@ static/lib/** -whitespace linguist-vendored
 *.ico  binary
 *.woff binary
 *.woff2 binary
+
+# Notes reference deployment modules.
+static/js/features/notes/** text eol=lf
+static/js/shared/ui/confetti.js text eol=lf
