@@ -2834,7 +2834,7 @@ def _parse_qwen_explicit_admin_request(text: str) -> Optional[tuple[str, str]]:
     if re.search(r"\b(?:disabled\s+tools?|tools?\s+(?:are\s+)?(?:currently\s+)?disabled)\b", q):
         return "manage_settings", json.dumps({"action": "list_tools"})
     if re.search(r"\b(?:turn|enable|re-enable|reenable)\b.{0,40}\b(?:image\s+generation|images?|generate_image)\b", q):
-        return "manage_settings", json.dumps({"action": "enable_tool", "tool": "images"})
+        return "manage_settings", json.dumps({"action": "list_tools"})
     if re.search(r"\b(?:disable|turn\s+off)\b.{0,40}\b(?:image\s+generation|images?|generate_image)\b", q):
         return "manage_settings", json.dumps({"action": "disable_tool", "tool": "images"})
     if listish and re.search(r"\bapi\s+tokens?\b|\btokens?\b", q):

@@ -585,7 +585,9 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
             return _ALIASES_SET.get(k2, (k or "").strip())
 
         def _is_managed_key(key):
-            return key in DEFAULT_SETTINGS and key not in RETIRED_SETTING_KEYS
+            # Tool policy is not a general setting, even if a future default
+            # is added: resetting it must never re-enable disabled tools.
+            return key != "disabled_tools" and key in DEFAULT_SETTINGS and key not in RETIRED_SETTING_KEYS
 
         _ENUMS = {
             "image_quality": ["low", "medium", "high"],
@@ -775,7 +777,8 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
                     "response": (
                         f"Currently disabled: {', '.join(current) if current else '(none)'}.\n"
                         "Common toggles: shell (bash), search (web_search), browser, documents, "
-                        "memory, skills, images, tasks, notes, calendar, email."
+                        "memory, skills, images, tasks, notes, calendar, email. "
+                        "To re-enable a tool, open Settings > Agent Tools."
                     ),
                     "disabled": list(current),
                     "exit_code": 0,

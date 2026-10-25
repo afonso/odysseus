@@ -77,6 +77,7 @@ def test_list_tools_still_reports_the_denylist(store):
     result = _call({"action": "list_tools"})
     assert result["exit_code"] == 0, result
     assert set(result["disabled"]) == {"bash", "manage_memory", "web_search", "web_fetch"}
+    assert "Settings > Agent Tools" in result["response"]
 
 
 @pytest.mark.parametrize("action", ["set", "delete", "reset"])
@@ -90,6 +91,65 @@ def test_disabled_tools_key_is_not_reachable_through_settings_actions(store, act
     result = _call(payload)
     assert result["exit_code"] == 1, result
     assert store["disabled_tools"] == before
+
+
+@pytest.mark.parametrize("action", ["set", "delete", "reset"])
+def test_disabled_tools_stays_protected_if_added_to_defaults(store, monkeypatch, action):
+    # The old rejection depended on disabled_tools not being in DEFAULT_SETTINGS.
+    monkeypatch.setitem(settings_mod.DEFAULT_SETTINGS, "disabled_tools", [])
+    before = list(store["disabled_tools"])
+    result = _call({"action": action, "key": "disabled_tools", "value": []})
+    assert result["exit_code"] == 1, result
+    assert store["disabled_tools"] == before
+
+
+@pytest.mark.parametrize("path", ["/api/tools", "api/tools", "/api/tools/", "/api/tools?source=chat"])
+def test_app_api_cannot_replace_global_tool_policy(monkeypatch, path):
+    import httpx
+    from src.tools.system import do_app_api
+
+    def no_loopback(*args, **kwargs):
+        raise AssertionError("Tool policy write reached the HTTP client")
+
+    monkeypatch.setattr(httpx, "AsyncClient", no_loopback)
+    result = asyncio.run(do_app_api(json.dumps({
+        "action": "call", "method": "post", "path": path, "body": {"disabled": []},
+    }), owner="admin"))
+    assert result["exit_code"] == 1
+    assert "Settings > Agent Tools" in result["error"]
+
+
+@pytest.mark.parametrize("internal", [True, False])
+def test_tools_api_requires_human_admin_for_policy_changes(store, monkeypatch, internal):
+    from types import SimpleNamespace
+    from starlette.requests import Request
+    from fastapi import HTTPException
+    from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN
+    import routes.model_routes as routes
+
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setattr(routes, "_load_settings", lambda: dict(store))
+    monkeypatch.setattr(routes, "_save_settings", lambda value: store.update(value))
+    router = routes.setup_model_routes(SimpleNamespace())
+    endpoint = next(r.endpoint for r in router.routes if r.path == "/api/tools" and "POST" in r.methods)
+    body = endpoint.__annotations__["body"](disabled=[])
+    headers = [(INTERNAL_TOOL_HEADER.lower().encode(), INTERNAL_TOOL_TOKEN.encode())] if internal else []
+    request = Request({
+        "type": "http", "method": "POST", "path": "/api/tools", "headers": headers,
+        "state": {"current_user": "admin"},
+        "app": SimpleNamespace(state=SimpleNamespace(auth_manager=SimpleNamespace(
+            is_configured=True, is_admin=lambda user: user == "admin",
+        ))),
+    })
+    if internal:
+        before = list(store["disabled_tools"])
+        with pytest.raises(HTTPException) as error:
+            endpoint(body, request)
+        assert error.value.status_code == 403
+        assert store["disabled_tools"] == before
+    else:
+        assert endpoint(body, request) == {"ok": True, "disabled": []}
+        assert store["disabled_tools"] == []
 
 
 def test_schema_no_longer_advertises_enable_tool():
