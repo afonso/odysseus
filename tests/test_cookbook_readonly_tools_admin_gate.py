@@ -16,7 +16,7 @@ admin-only, so the read side has to be gated the same way as serve/download.
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -26,6 +26,7 @@ from src.tool_security import (
     delegated_credential_blocked_tools,
 )
 from src.tool_execution import _ADMIN_TOOLS
+from src.agent_runtime.authority import OperationGrant, RequestAuthority
 
 READONLY_COOKBOOK_TOOLS = (
     "list_cached_models",
@@ -59,11 +60,14 @@ def _install_core_auth_stub(monkeypatch, *, is_admin: bool):
 
 
 def test_readonly_cookbook_tools_are_in_every_admin_gate():
+    from src.agent_loop import _ADMIN_TOOLS as prompt_admin_tools
+
     # Spelled out (not imported from a shared tuple in src/) so dropping one
     # from either set fails here instead of silently reopening the hole.
     for tool in READONLY_COOKBOOK_TOOLS:
         assert tool in NON_ADMIN_BLOCKED_TOOLS, tool
         assert tool in _ADMIN_TOOLS, tool
+        assert tool in prompt_admin_tools, tool
 
 
 def test_readonly_cookbook_tools_hidden_from_non_admin_and_bearer_runs(monkeypatch):
@@ -101,7 +105,32 @@ async def test_non_admin_agent_cannot_execute_readonly_cookbook_tools(monkeypatc
         SimpleNamespace(tool_type=tool_name, content=payload),
         owner="regular-user",
         security_context=NO_TOOL_SECURITY_CONTEXT,
+        request_authority=RequestAuthority(
+            "cookbook-test", "regular-user", "", "", (OperationGrant(tool_name),)
+        ),
     )
     assert desc == f"{tool_name}: BLOCKED"
     assert result["exit_code"] == 1
     assert "admin" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", READONLY_COOKBOOK_TOOLS)
+async def test_admin_agent_can_dispatch_readonly_cookbook_tools(monkeypatch, tool_name):
+    from src import tool_implementations
+    from src.tool_execution import NO_TOOL_SECURITY_CONTEXT, execute_tool_block
+
+    _install_core_auth_stub(monkeypatch, is_admin=True)
+    handler = AsyncMock(return_value={"output": "Cookbook result", "exit_code": 0})
+    monkeypatch.setattr(tool_implementations, f"do_{tool_name}", handler)
+    desc, result = await execute_tool_block(
+        SimpleNamespace(tool_type=tool_name, content="{}"),
+        owner="admin-user",
+        security_context=NO_TOOL_SECURITY_CONTEXT,
+        request_authority=RequestAuthority(
+            "cookbook-test", "admin-user", "", "", (OperationGrant(tool_name),)
+        ),
+    )
+    assert desc == tool_name
+    assert result["exit_code"] == 0
+    handler.assert_awaited_once_with("{}", owner="admin-user")
