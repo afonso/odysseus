@@ -164,3 +164,64 @@ def test_schema_no_longer_advertises_enable_tool():
     assert "enable_tool" not in actions
     assert "disable_tool" in actions and "list_tools" in actions
     assert "enable_tool" not in schema["description"]
+
+
+@pytest.mark.parametrize("path", [
+    "/api/mcp/servers/srv1/tools", "api/mcp/servers/srv1/tools", "/api/mcp/servers/srv1",
+])
+def test_app_api_cannot_change_mcp_tool_policy(monkeypatch, path):
+    import httpx
+    from src.tools.system import do_app_api
+
+    def no_loopback(*args, **kwargs):
+        raise AssertionError("MCP tool policy write reached the HTTP client")
+
+    monkeypatch.setattr(httpx, "AsyncClient", no_loopback)
+    result = asyncio.run(do_app_api(json.dumps({
+        "action": "call", "method": "patch", "path": path, "body": {"disabled": []},
+    }), owner="admin"))
+    assert result["exit_code"] == 1
+    assert "Settings > Integrations" in result["error"]
+
+
+@pytest.mark.parametrize("internal", [True, False])
+def test_mcp_tools_api_requires_human_admin_for_policy_changes(monkeypatch, internal):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from starlette.requests import Request
+    from fastapi import HTTPException
+    from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN
+    from routes.mcp import mcp_routes
+
+    server = SimpleNamespace(id="srv1", disabled_tools=json.dumps(["send_email"]))
+    session = MagicMock()
+    session.query.return_value.filter.return_value.first.return_value = server
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setattr(mcp_routes, "SessionLocal", lambda: session)
+    router = mcp_routes.setup_mcp_routes(MagicMock())
+    # setup_mcp_routes appends to the shared module router; take the latest.
+    endpoint = [r.endpoint for r in router.routes if getattr(r, "name", None) == "update_disabled_tools"][-1]
+    headers = [(b"content-type", b"application/json")]
+    if internal:
+        headers.append((INTERNAL_TOOL_HEADER.lower().encode(), INTERNAL_TOOL_TOKEN.encode()))
+
+    async def receive():
+        return {"type": "http.request", "body": b'{"disabled": []}', "more_body": False}
+
+    request = Request({
+        "type": "http", "method": "PATCH", "path": "/api/mcp/servers/srv1/tools", "headers": headers,
+        "state": {"current_user": "admin"},
+        "app": SimpleNamespace(state=SimpleNamespace(auth_manager=SimpleNamespace(
+            is_configured=True, is_admin=lambda user: user == "admin",
+        ))),
+    }, receive)
+    if internal:
+        with pytest.raises(HTTPException) as error:
+            asyncio.run(endpoint("srv1", request))
+        assert error.value.status_code == 403
+        assert server.disabled_tools == json.dumps(["send_email"])
+        session.commit.assert_not_called()
+    else:
+        assert asyncio.run(endpoint("srv1", request)) == {"id": "srv1", "disabled_count": 0}
+        assert server.disabled_tools is None
+        session.commit.assert_called_once()
